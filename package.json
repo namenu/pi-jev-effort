@@ -1,0 +1,43 @@
+{
+  "name": "pi-jev-effort",
+  "version": "0.1.0",
+  "description": "Pi extension that sets the session's thinking level per prompt from a TypeSafe Jev judgement, clamped by the quota you have left",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "extension",
+    "jev",
+    "typesafe",
+    "openrouter",
+    "thinking-level",
+    "reasoning-effort",
+    "usage"
+  ],
+  "author": "namenu <namenu@gmail.com>",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/namenu/pi-jev-effort.git"
+  },
+  "homepage": "https://github.com/namenu/pi-jev-effort#readme",
+  "bugs": {
+    "url": "https://github.com/namenu/pi-jev-effort/issues"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "files": [
+    "index.ts",
+    "usage.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
