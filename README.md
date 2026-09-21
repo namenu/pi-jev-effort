@@ -124,7 +124,7 @@ Optional, at `~/.pi/agent/jev-effort.json`. Defaults:
   "apiKey": null,
   "baseUrl": null,
   "model": null,
-  "timeoutMs": 2500,
+  "timeoutMs": 4000,
   "levels": ["minimal", "low", "medium", "high"],
   "minUpgradeConfidence": 0.3,
   "minDowngradeConfidence": 0.6,

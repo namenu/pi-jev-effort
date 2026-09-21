@@ -74,7 +74,7 @@ export const DEFAULTS: Config = {
   apiKey: null,
   baseUrl: null,
   model: null,
-  timeoutMs: 2500,
+  timeoutMs: 4000,
   levels: ["minimal", "low", "medium", "high"],
   // Asymmetric on purpose: spending more thinking than needed costs tokens,
   // spending less costs a wrong answer, so upgrades clear a lower bar.
