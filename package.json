@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-effort",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that sets the session's thinking level per prompt from a TypeSafe Jev judgement, clamped by the quota you have left",
   "keywords": [
     "pi-package",
@@ -30,6 +30,7 @@
   },
   "files": [
     "index.ts",
+    "decide.ts",
     "usage.ts",
     "README.md",
     "LICENSE"
@@ -38,6 +39,8 @@
     "test": "node --test"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }

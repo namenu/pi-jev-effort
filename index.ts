@@ -3,6 +3,15 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { readFileSync } from "node:fs";
 import {
+  atLeast,
+  atMost,
+  bar,
+  chooseIndex,
+  mode,
+  sparkline,
+  type Judgement,
+} from "./decide.ts";
+import {
   humanizeReset,
   openRouterCredits,
   parseRateLimitHeaders,
@@ -33,6 +42,7 @@ const ENDPOINTS: Record<Provider, { baseUrl: string; path: string; model: string
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "jev-effort.json");
 const STATUS_KEY = "jev-effort";
+const HISTORY = 10;
 
 export interface Config {
   enabled: boolean;
@@ -44,11 +54,13 @@ export interface Config {
   timeoutMs: number;
   /** Rubric index -> thinking level. */
   levels: ThinkingLevel[];
+  /** Share of the distribution that must reach a level before moving up to it. */
   minUpgradeConfidence: number;
+  /** Share of the distribution that must fall under a level before moving down to it. */
   minDowngradeConfidence: number;
   floor: ThinkingLevel | null;
   ceiling: ThinkingLevel | null;
-  /** Prompts shorter than this keep the current level without a Jev call. */
+  /** Skip prompts shorter than this; 0 judges everything, which is the default. */
   minPromptChars: number;
   budget: BudgetConfig;
   notify: boolean;
@@ -82,7 +94,7 @@ export const DEFAULTS: Config = {
   minDowngradeConfidence: 0.6,
   floor: null,
   ceiling: null,
-  minPromptChars: 12,
+  minPromptChars: 0,
   budget: {
     source: "auto",
     windowHours: 5,
@@ -109,55 +121,61 @@ const RUBRIC = [
     "conflicting constraints, work that needs a plan and verification before it can be trusted.",
 ] as const;
 
+const RUBRIC_LABELS = ["trivial", "routine", "substantial", "hard"] as const;
+
 const INSTRUCTIONS =
   "A developer sent this prompt to a coding agent. How much step-by-step reasoning does " +
   "answering it well require? Judge the work the prompt asks for, not how politely it is " +
-  "written and not how long it is.";
+  "written and not how long it is. A short prompt continuing earlier work asks for as much " +
+  "as the work it continues.";
 
 export const rankOf = (level: string): number => {
   const i = LEVELS.indexOf(level as ThinkingLevel);
   return i === -1 ? 0 : i;
 };
 
-const clampLevel = (level: ThinkingLevel, cfg: Config): ThinkingLevel => {
+const clampLevel = (
+  level: ThinkingLevel,
+  floor: ThinkingLevel | null,
+  ceiling: ThinkingLevel | null,
+): ThinkingLevel => {
   let rank = rankOf(level);
-  if (cfg.floor) rank = Math.max(rank, rankOf(cfg.floor));
-  if (cfg.ceiling) rank = Math.min(rank, rankOf(cfg.ceiling));
+  if (floor) rank = Math.max(rank, rankOf(floor));
+  if (ceiling) rank = Math.min(rank, rankOf(ceiling));
   return LEVELS[rank];
 };
 
-/**
- * Map an expected score onto a level, then apply hysteresis against the level
- * already in effect. Returns null when the current level should stand.
- */
-export const decide = (
-  current: ThinkingLevel,
-  score: number,
-  confidence: number,
-  cfg: Config,
-): ThinkingLevel | null => {
-  const index = Math.min(cfg.levels.length - 1, Math.max(0, Math.round(score)));
-  const target = clampLevel(cfg.levels[index], cfg);
-  const delta = rankOf(target) - rankOf(current);
-  if (delta === 0) return null;
-  const needed = delta > 0 ? cfg.minUpgradeConfidence : cfg.minDowngradeConfidence;
-  return confidence >= needed ? target : null;
+/** Where the current level sits on the rubric: exact match, else nearest rank. */
+export const indexOfLevel = (level: ThinkingLevel, levels: ThinkingLevel[]): number => {
+  const exact = levels.indexOf(level);
+  if (exact !== -1) return exact;
+  let best = 0;
+  let distance = Number.POSITIVE_INFINITY;
+  levels.forEach((candidate, i) => {
+    const d = Math.abs(rankOf(candidate) - rankOf(level));
+    if (d < distance) {
+      distance = d;
+      best = i;
+    }
+  });
+  return best;
 };
 
 /**
- * The level to switch to, or null to stay put. The judgement decides direction
- * and has to clear its confidence bar; the ceiling is a hard cap that does not,
- * because a budget that has run out is not an opinion.
+ * The level to switch to, or null to stay put. The distribution decides the
+ * direction and has to clear its threshold; the ceiling is a hard cap that does
+ * not, because a budget that has run out is not an opinion.
  */
 export const plan = (
   current: ThinkingLevel,
-  score: number,
-  confidence: number,
+  judgement: Judgement,
   cfg: Config,
   ceiling: ThinkingLevel | null,
 ): ThinkingLevel | null => {
-  const proposed = decide(current, score, confidence, { ...cfg, ceiling: null }) ?? current;
-  const capped = clampLevel(proposed, { ...cfg, ceiling });
+  const currentIndex = indexOfLevel(current, cfg.levels);
+  const target = chooseIndex(currentIndex, judgement.probabilities, cfg);
+  const proposed = target === null ? current : cfg.levels[target];
+  const capped = clampLevel(proposed, cfg.floor, ceiling);
   return capped === current ? null : capped;
 };
 
@@ -200,11 +218,6 @@ export const buildRoute = (provider: Provider, apiKey: string, cfg: Config): Rou
   };
 };
 
-export interface Judgement {
-  score: number;
-  confidence: number;
-}
-
 export const classify = async (
   state: Record<string, unknown>,
   route: Route,
@@ -229,22 +242,39 @@ export const classify = async (
     throw new Error(`${route.provider} ${res.status}: ${(await res.text()).slice(0, 300)}`);
   }
   const body = (await res.json()) as {
-    answers?: { effort?: { score?: unknown; confidence?: unknown } };
+    answers?: {
+      effort?: { score?: unknown; confidence?: unknown; probabilities?: Record<string, unknown> };
+    };
   };
-  const { score, confidence } = body.answers?.effort ?? {};
-  if (typeof score !== "number" || typeof confidence !== "number") return null;
-  return { score, confidence };
+  const answer = body.answers?.effort;
+  if (typeof answer?.score !== "number" || typeof answer.confidence !== "number") return null;
+  const probabilities = RUBRIC.map((_, i) => {
+    const v = answer.probabilities?.[String(i)];
+    return typeof v === "number" ? v : 0;
+  });
+  if (probabilities.every((v) => v === 0)) return null;
+  return { score: answer.score, confidence: answer.confidence, probabilities };
 };
+
+interface Recorded extends Judgement {
+  at: number;
+  prompt: string;
+  from: ThinkingLevel;
+  to: ThinkingLevel;
+}
 
 export default function (pi: ExtensionAPI) {
   const cfg = loadConfig();
   let paused = false;
   let lastApplied: ThinkingLevel | null = null;
-  let lastJudgement: Judgement | null = null;
   let lastRoute: Route | null = null;
   let lastBudget: Budget | null = null;
   let observedLimit: RateLimit | null = null;
   let balance: { at: number; remainingFraction: number } | null = null;
+  const history: Recorded[] = [];
+  // Context for a follow-up too short to judge on its own.
+  let previousReply: string | null = null;
+  let previousTools: string[] = [];
   // Set while we call setThinkingLevel so the resulting event is not read as a
   // manual override. Model changes clamp the level too, hence the timestamp.
   let applying = false;
@@ -292,10 +322,9 @@ export default function (pi: ExtensionAPI) {
     if (b.source === "auto" || b.source === "headers") {
       const l = observedLimit;
       if (l?.limit && l.remaining !== undefined) {
-        const fraction = Math.max(0, Math.min(1, l.remaining / l.limit));
         return {
           source: "headers",
-          remainingFraction: fraction,
+          remainingFraction: Math.max(0, Math.min(1, l.remaining / l.limit)),
           resetAt: l.resetAt ?? null,
           spend,
           exhaustsBeforeReset: false,
@@ -309,7 +338,9 @@ export default function (pi: ExtensionAPI) {
       if (!fresh) {
         try {
           const credits = await openRouterCredits(route.apiKey, cfg.timeoutMs);
-          balance = credits ? { at: Date.now(), remainingFraction: credits.remainingFraction } : null;
+          balance = credits
+            ? { at: Date.now(), remainingFraction: credits.remainingFraction }
+            : null;
         } catch {
           // A balance lookup is advisory; losing it must not change the turn.
         }
@@ -353,22 +384,66 @@ export default function (pi: ExtensionAPI) {
   const status = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
     if (!cfg.enabled || paused) {
-      ctx.ui.setStatus(STATUS_KEY, paused ? "jev: paused" : undefined);
+      ctx.ui.setStatus(STATUS_KEY, paused ? "jev paused" : undefined);
       return;
     }
-    const j = lastJudgement;
-    const b = lastBudget;
-    const parts = [j ? `jev: ${pi.getThinkingLevel()} (${j.confidence.toFixed(2)})` : "jev: auto"];
-    if (b?.remainingFraction !== null && b !== null) {
-      parts.push(`${Math.round(b.remainingFraction! * 100)}%`);
+    const last = history[0];
+    const level = pi.getThinkingLevel() as ThinkingLevel;
+    let head = "jev auto";
+    if (last) {
+      // A tilde marks a level the judgement leans away from but could not move:
+      // the distribution pointed elsewhere without clearing its threshold.
+      const leaning = cfg.levels[mode(last.probabilities)];
+      const held = leaning !== level ? "~" : "";
+      head = `jev ${sparkline(last.probabilities)} ${held}${level}`;
     }
+    const parts = [head];
+    const b = lastBudget;
+    if (b && b.remainingFraction !== null) parts.push(`${Math.round(b.remainingFraction * 100)}%`);
     const reset = humanizeReset(b?.resetAt ?? null);
     if (reset) parts.push(`resets ${reset}`);
     ctx.ui.setStatus(STATUS_KEY, parts.join(" · "));
   };
 
+  const readout = (): string => {
+    const last = history[0];
+    const level = pi.getThinkingLevel();
+    const state = !cfg.enabled ? "off" : paused ? "paused" : "on";
+    const lines = [
+      `jev-effort ${state} · via ${lastRoute?.provider ?? "unresolved"} · level ${level}`,
+    ];
+    if (last) {
+      lines.push(`last: ${JSON.stringify(last.prompt.slice(0, 60))} → ${last.from} → ${last.to}`);
+      last.probabilities.forEach((v, i) => {
+        const label = (RUBRIC_LABELS[i] ?? String(i)).padEnd(11);
+        const level = (cfg.levels[i] ?? "?").padEnd(7);
+        lines.push(`  ${i} ${label} ${level} ${bar(v)} ${v.toFixed(2)}`);
+      });
+      lines.push(
+        `  score ${last.score.toFixed(2)} · confidence ${last.confidence.toFixed(2)} · ` +
+          `P(≤${mode(last.probabilities)})=${atMost(last.probabilities, mode(last.probabilities)).toFixed(2)}`,
+      );
+    } else {
+      lines.push("no judgement yet in this session");
+    }
+    const b = lastBudget;
+    if (b) {
+      const left = b.remainingFraction === null ? "?" : `${Math.round(b.remainingFraction * 100)}%`;
+      const reset = humanizeReset(b.resetAt);
+      lines.push(
+        `budget ${b.source} ${left}${reset ? ` (resets ${reset})` : ""} · ` +
+          `${b.spend.tokens.toLocaleString()} tok / $${b.spend.usd.toFixed(3)} in ` +
+          `${cfg.budget.windowHours}h · $${b.spend.burnUsdPerMin.toFixed(5)}/min`,
+      );
+    }
+    return lines.join("\n");
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     levelChurnUntil = Date.now() + 2000;
+    history.length = 0;
+    previousReply = null;
+    previousTools = [];
     if (cfg.enabled) {
       const route = await resolveRoute(ctx);
       if (!route) {
@@ -377,7 +452,7 @@ export default function (pi: ExtensionAPI) {
             "jev-effort: no key. Set TYPESAFE_API_KEY, or sign in to OpenRouter in pi.",
             "warning",
           );
-          ctx.ui.setStatus(STATUS_KEY, "jev: no key");
+          ctx.ui.setStatus(STATUS_KEY, "jev no key");
         }
         return;
       }
@@ -390,6 +465,23 @@ export default function (pi: ExtensionAPI) {
     // Free of charge: whatever the provider already said about its own limits.
     const seen = parseRateLimitHeaders(event.headers ?? {});
     if (seen) observedLimit = { ...observedLimit, ...seen };
+  });
+
+  pi.on("turn_end", async (event, _ctx) => {
+    // Remembered so the next prompt, however short, can be judged in context.
+    const content = (event.message as { content?: unknown } | undefined)?.content;
+    const text = typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content
+            .map((part) => (typeof part === "object" && part && "text" in part ? String((part as { text: unknown }).text) : ""))
+            .join(" ")
+        : "";
+    previousReply = text.trim().slice(0, 300) || previousReply;
+    const results = (event.toolResults ?? []) as { toolName?: string }[];
+    if (results.length) {
+      previousTools = [...new Set(results.map((r) => r.toolName ?? "").filter(Boolean))];
+    }
   });
 
   pi.on("model_select", async (_event, ctx) => {
@@ -414,9 +506,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (!cfg.enabled || paused) return;
     const prompt = (event.prompt ?? "").trim();
-    // Short follow-ups ("continue", "yes") carry no signal of their own; classifying
-    // them would drag the level back down in the middle of hard work.
-    if (prompt.length < cfg.minPromptChars) return;
+    if (prompt.length < Math.max(1, cfg.minPromptChars)) return;
 
     const current = pi.getThinkingLevel() as ThinkingLevel;
     let judgement: Judgement | null = null;
@@ -430,6 +520,9 @@ export default function (pi: ExtensionAPI) {
           project: basename(ctx.cwd),
           model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
           current_thinking_level: current,
+          continuing_work: previousReply !== null,
+          previous_reply: previousReply,
+          previous_tools: previousTools.length ? previousTools : null,
         },
         route,
         cfg,
@@ -440,20 +533,19 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!judgement) return;
-    lastJudgement = judgement;
 
     const budget = await resolveBudget(lastRoute);
     lastBudget = budget;
     const ceiling = effectiveCeiling(budget);
-    const next = plan(current, judgement.score, judgement.confidence, cfg, ceiling);
+    const next = plan(current, judgement, cfg, ceiling);
+    const p = judgement.probabilities;
     const left =
-      budget.remainingFraction === null
-        ? "n/a"
-        : `${Math.round(budget.remainingFraction * 100)}%`;
+      budget.remainingFraction === null ? "n/a" : `${Math.round(budget.remainingFraction * 100)}%`;
     log(
-      `score=${judgement.score.toFixed(2)} conf=${judgement.confidence.toFixed(2)} ` +
-        `budget=${budget.source}:${left} burn=$${budget.spend.burnUsdPerMin.toFixed(5)}/min ` +
-        `ceiling=${ceiling ?? "none"} ${current} -> ${next ?? current}`,
+      `${sparkline(p)} score=${judgement.score.toFixed(2)} conf=${judgement.confidence.toFixed(2)} ` +
+        `P(<=${indexOfLevel(current, cfg.levels)})=${atMost(p, indexOfLevel(current, cfg.levels)).toFixed(2)} ` +
+        `P(>=${indexOfLevel(current, cfg.levels)})=${atLeast(p, indexOfLevel(current, cfg.levels)).toFixed(2)} ` +
+        `budget=${budget.source}:${left} ceiling=${ceiling ?? "none"} ${current} -> ${next ?? current}`,
     );
     if (next) {
       applying = true;
@@ -464,13 +556,21 @@ export default function (pi: ExtensionAPI) {
       }
       // Pi clamps to what the model supports, so record what actually took effect.
       lastApplied = pi.getThinkingLevel() as ThinkingLevel;
-      if (cfg.notify && ctx.hasUI) ctx.ui.notify(`jev-effort: ${current} -> ${next}`, "info");
+      if (cfg.notify && ctx.hasUI) ctx.ui.notify(`jev-effort: ${current} → ${next}`, "info");
     }
+    history.unshift({
+      ...judgement,
+      at: Date.now(),
+      prompt,
+      from: current,
+      to: (next ?? current) as ThinkingLevel,
+    });
+    history.length = Math.min(history.length, HISTORY);
     status(ctx);
   });
 
   pi.registerCommand("jev-effort", {
-    description: "Jev-driven automatic thinking level: on | off | status",
+    description: "Jev-driven thinking level: status | on | off | last",
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
       if (arg === "on") {
@@ -478,26 +578,21 @@ export default function (pi: ExtensionAPI) {
         paused = false;
       } else if (arg === "off") {
         cfg.enabled = false;
+      } else if (arg === "last") {
+        const lines = history.length
+          ? history.map((h) => {
+              const moved = h.from === h.to ? `${h.to} held` : `${h.from} → ${h.to}`;
+              return `${sparkline(h.probabilities)} ${h.score.toFixed(2)} ${moved}  ${h.prompt.slice(0, 40)}`;
+            })
+          : ["no judgements yet in this session"];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
       } else if (arg && arg !== "status") {
-        ctx.ui.notify("jev-effort: usage /jev-effort [on|off|status]", "warning");
+        ctx.ui.notify("jev-effort: usage /jev-effort [status|on|off|last]", "warning");
         return;
       }
-      const state = !cfg.enabled ? "off" : paused ? "paused" : "on";
-      const j = lastJudgement;
-      const b = lastBudget ?? (await resolveBudget(lastRoute));
-      lastBudget = b;
-      const left = b.remainingFraction === null ? "?" : `${Math.round(b.remainingFraction * 100)}%`;
-      const reset = humanizeReset(b.resetAt);
-      ctx.ui.notify(
-        `jev-effort ${state} · via ${lastRoute?.provider ?? "unresolved"} · ` +
-          `level ${pi.getThinkingLevel()}` +
-          (j ? ` · last score ${j.score.toFixed(2)} @ ${j.confidence.toFixed(2)}` : "") +
-          ` · budget ${b.source} ${left}` +
-          (reset ? ` (resets ${reset})` : "") +
-          ` · ${b.spend.tokens.toLocaleString()} tok / $${b.spend.usd.toFixed(3)} ` +
-          `in ${cfg.budget.windowHours}h`,
-        "info",
-      );
+      if (!lastBudget) lastBudget = await resolveBudget(lastRoute);
+      ctx.ui.notify(readout(), "info");
       status(ctx);
     },
   });
