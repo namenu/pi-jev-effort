@@ -5,10 +5,11 @@ Sets the thinking level of a [pi](https://pi.dev) session for every prompt, from
 by how much of your quota is left.
 
 ```
-[jev-effort] score=0.00 conf=1.00 budget=openrouter:58% burn=$0.00064/min ceiling=none high -> minimal
-[jev-effort] score=2.38 conf=0.54 budget=openrouter:58% burn=$0.00046/min ceiling=none high -> high
-[jev-effort] score=2.36 conf=0.55 budget=local:0%      burn=$0.00114/min ceiling=low  high -> low
+jev ▁▁█▁ medium · 57% · resets 2h11m
 ```
+
+The four blocks are Jev's probability for each rung of the rubric — trivial, routine,
+substantial, hard — so a split answer is visible rather than averaged away.
 
 Jev is a System One model: it answers a typed question with a distribution instead of prose, so
 one call returns a score on your rubric plus the confidence behind it. A judgement takes about
@@ -50,28 +51,35 @@ There are no npm dependencies. Both transports take the same body and return the
 
 ## How a level gets chosen
 
-**1. Jev scores the prompt** against a four-level rubric — trivial, routine, substantial, hard —
-and returns an expected score with its confidence. Measured against `~typesafe/jev-latest`
-(resolved as `typesafe/jev-1.13-20260917`):
+**1. Jev answers one scored question** about the prompt, against a four-level rubric — trivial,
+routine, substantial, hard — and returns a probability for each rung. Measured against
+`~typesafe/jev-latest` (resolved as `typesafe/jev-1.13-20260917`), about 250ms per call:
 
-| Prompt | Score | Confidence | Latency | Cost |
-|---|---|---|---|---|
-| `list the files in this directory, nothing else` | 0.00 | 1.00 | — | — |
-| `rename the variable foo to bar in utils.ts` | 0.43 | 0.57 | 281ms | $0.0000149 |
-| `why does the run index drift from the runner status file after a crash` | 2.38 | 0.54 | — | — |
-| `find why the scheduler deadlocks under concurrent compaction and fix it` | 2.87 | 0.87 | 235ms | $0.0000151 |
+| Prompt | Distribution | Reads as |
+|---|---|---|
+| `안녕` / `show me the files in this directory` | `1.00 / 0 / 0 / 0` | certainly trivial |
+| `fix the typo in the README` | `0.93 / 0.07 / 0 / 0` | trivial |
+| `refactor this` | `0.07 / 0.07 / 0.80 / 0.06` | substantial |
+| `fix this` | `0.47 / 0.09 / 0.43 / 0.01` | could be either, and says so |
 
-**2. Hysteresis decides whether to move.** An upgrade needs confidence ≥ 0.3, a downgrade ≥ 0.6.
-Thinking more than necessary costs tokens; thinking less costs the answer, so the bars are not
-symmetric. The third row above is why: at 0.54 the score leans substantial but not firmly enough to
-give up a level you already have.
+**2. Cumulative mass decides whether to move**, not the average. The scale is ordinal, so the
+question is how much of the answer sits at or beyond a level: move up to the highest level that
+`P(score ≥ level) ≥ 0.3` reaches, or down to the lowest that `P(score ≤ level) ≥ 0.6` covers.
+Upgrades clear a lower bar because thinking too much costs tokens while thinking too little costs
+the answer.
+
+The last row is why the average is the wrong summary. Its mean is 0.96 with a reported confidence
+of 0.04 — round that and you land on a rung nothing voted for, at a confidence no threshold will
+ever pass, and the level sticks wherever it happens to be. On cumulative mass the same answer moves
+a session down from `high` to `medium` (`P(≤2) = 0.99`) and leaves it there, which is what a
+genuinely ambiguous prompt deserves.
 
 **3. The budget caps the result.** A ceiling from quota pressure is a hard cap, not an opinion — it
-applies whether or not Jev was confident. Everything else about the turn is unchanged.
+applies whether or not the distribution could move anything.
 
-Short prompts never reach step 1. "continue" or "yes" carries no signal of its own, and classifying
-it would drag the level down in the middle of hard work, so anything under 12 characters keeps the
-current level and makes no call.
+Every prompt is judged, including one-word ones. A greeting is the easiest call Jev makes, and a
+short follow-up like "continue" is sent with the previous reply and the tools that ran, so it is
+judged against the work it continues rather than on its own two words.
 
 ## Budget, burn rate and reset
 
@@ -99,14 +107,28 @@ it resets counts as one threshold worse:
 ]
 ```
 
-The footer carries it: `jev: high (0.87) · 58% · resets 2h11m`.
+The footer carries it: `jev ▁▂█▁ medium · 57% · resets 2h11m`. A `~` before the level — 
+`jev ▄▂▄▁ ~medium` — means the distribution leans somewhere else but did not clear its threshold,
+so the level is being held rather than chosen.
 
 ## Command
 
 ```
-/jev-effort           # status, including budget source, burn and reset
+/jev-effort           # full readout: distribution, level, budget, burn, reset
+/jev-effort last      # the last ten judgements, one sparkline each
 /jev-effort on        # enable, and clear a manual pause
 /jev-effort off       # disable for this session
+```
+
+```
+jev-effort on · via openrouter · level medium
+last: "make it cleaner" → medium → medium
+  0 trivial     minimal ███·······  0.34
+  1 routine     low     ██········  0.20
+  2 substantial medium  █████·····  0.46
+  3 hard        high    ··········  0.00
+  score 1.13 · confidence 0.12 · P(≤2)=1.00
+budget openrouter 57% · 1,203,164 tok / $0.031 in 5h · $0.00046/min
 ```
 
 Change the level yourself with `/effort` or `Ctrl+Shift+E` and automatic routing pauses for the
@@ -130,7 +152,7 @@ Optional, at `~/.pi/agent/jev-effort.json`. Defaults:
   "minDowngradeConfidence": 0.6,
   "floor": null,
   "ceiling": null,
-  "minPromptChars": 12,
+  "minPromptChars": 0,
   "budget": {
     "source": "auto",
     "windowHours": 5,
@@ -146,9 +168,15 @@ Optional, at `~/.pi/agent/jev-effort.json`. Defaults:
 }
 ```
 
-`levels` maps rubric scores 0–3 onto pi thinking levels, so a model with `xhigh` and `max` can use
-them: `["low", "medium", "high", "max"]`. `floor` and `ceiling` clamp every result. `JEV_EFFORT_DEBUG=1`
-prints one line per judgement to stderr, as at the top of this README.
+`levels` maps rubric rungs 0–3 onto pi thinking levels, so a model with `xhigh` and `max` can use
+them: `["low", "medium", "high", "max"]`. `minUpgradeConfidence` and `minDowngradeConfidence` are
+shares of the distribution, not Jev's reported confidence. `floor` and `ceiling` clamp every result,
+and `minPromptChars` above 0 brings back a length guard if you want one. `JEV_EFFORT_DEBUG=1` prints
+one line per judgement to stderr:
+
+```
+[jev-effort] ▁▁█▁ score=2.02 conf=0.85 P(<=3)=1.00 P(>=3)=0.09 budget=openrouter:57% ceiling=none medium -> medium
+```
 
 Pi clamps whatever it is given to what the model supports, so `minimal` can land as `low`. That is
 pi, not this extension, and the status line shows what actually took effect.
@@ -165,8 +193,9 @@ judgement layer.
 node --test
 ```
 
-The tests cover the hysteresis rule, the hard cap, the wire contract of both transports with `fetch`
-mocked, transcript parsing and burn rate, rate-limit header shapes, and the UTC window grid. For an
+The tests cover the cumulative-mass rule against real distributions, the hard cap, the wire contract
+of both transports with `fetch` mocked, transcript parsing and burn rate, rate-limit header shapes,
+and the UTC window grid. For an
 end-to-end check, point `baseUrl` at a local server that answers
 
 ```json
